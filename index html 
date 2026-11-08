@@ -1,0 +1,676 @@
+mkdir -p app/api/'[...path]' lib
+cat > package.json <<'EOF'
+{
+  "name": "survey-kenya-ltd",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "next": "^15.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  }
+}
+EOF
+
+cat > next.config.mjs <<'EOF'
+const nextConfig = {};
+export default nextConfig;
+EOF
+
+cat > jsconfig.json <<'EOF'
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": { "@/*": ["./*"] }
+  }
+}
+EOF
+
+cat > .gitignore <<'EOF'
+node_modules
+.next
+.env
+.env.local
+.vercel
+EOF
+
+cat > .env.example <<'EOF'
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
+EOF
+
+cat > lib/supabase.js <<'EOF'
+import { createClient } from "@supabase/supabase-js";
+
+export function browserSupabase() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
+}
+
+export function serverSupabase() {
+  return createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    { auth: { persistSession: false, autoRefreshToken: false } }
+  );
+}
+EOF
+
+cat > app/api/'[...path]'/route.js <<'EOF'
+import { NextResponse } from "next/server";
+import { serverSupabase } from "@/lib/supabase";
+
+const db = () => serverSupabase();
+const reply = (data, status = 200) => NextResponse.json(data, { status });
+
+async function getUser(req) {
+  const token = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const { data, error } = await db().auth.getUser(token);
+  return error ? null : data.user;
+}
+
+async function getProfile(id) {
+  const { data } = await db().from("profiles").select("*").eq("id", id).single();
+  return data;
+}
+
+async function isUnlocked(userId, surveyId) {
+  const { data } = await db().from("unlocks").select("id")
+    .eq("user_id", userId).or(`survey_id.is.null,survey_id.eq.${surveyId}`);
+  return !!data?.length;
+}
+
+async function adminUser(req) {
+  const user = await getUser(req);
+  if (!user) return { error: reply({ error: "Please log in." }, 401) };
+  const profile = await getProfile(user.id);
+  if (profile?.role !== "admin") {
+    return { error: reply({ error: "Admin access required." }, 403) };
+  }
+  return { user, profile };
+}
+
+export async function GET(req, context) {
+  try {
+    const { path = [] } = await context.params;
+    const route = path.join("/");
+    const user = await getUser(req);
+    if (!user) return reply({ error: "Please log in first." }, 401);
+
+    if (route === "me") {
+      return reply({ user, profile: await getProfile(user.id) });
+    }
+
+    if (route === "surveys") {
+      const { data, error } = await db().from("surveys")
+        .select("id,title,description,created_at")
+        .eq("active", true).order("created_at", { ascending: false });
+      if (error) throw error;
+
+      const { data: unlocks } = await db().from("unlocks")
+        .select("survey_id").eq("user_id", user.id);
+      const unlockedIds = new Set((unlocks || []).map(x => x.survey_id));
+      const hasGlobalUnlock = unlockedIds.has(null);
+
+      return reply({
+        surveys: (data || []).map(s => ({
+          ...s, unlocked: hasGlobalUnlock || unlockedIds.has(s.id)
+        }))
+      });
+    }
+
+    if (route.startsWith("surveys/")) {
+      const id = route.split("/")[1];
+      if (!(await isUnlocked(user.id, id))) {
+        return reply({ error: "Your survey access is locked. Submit the KSh 100 payment first." }, 403);
+      }
+      const { data, error } = await db().from("surveys")
+        .select("id,title,description,questions").eq("id", id).single();
+      if (error) throw error;
+      return reply({ survey: data });
+    }
+
+    if (route === "admin") {
+      const admin = await adminUser(req);
+      if (admin.error) return admin.error;
+
+      const [users, payments, surveys] = await Promise.all([
+        db().from("profiles").select("id,full_name,role,promo_balance,created_at"),
+        db().from("payments").select("*").order("created_at", { ascending: false }),
+        db().from("surveys").select("*").order("created_at", { ascending: false })
+      ]);
+
+      const rows = payments.data || [];
+      for (const p of rows) {
+        if (p.receipt_path) {
+          const { data } = await db().storage.from("payment-receipts")
+            .createSignedUrl(p.receipt_path, 3600);
+          p.receipt_url = data?.signedUrl || null;
+        }
+      }
+
+      return reply({
+        users: users.data || [],
+        payments: rows,
+        surveys: surveys.data || []
+      });
+    }
+
+    return reply({ error: "Not found." }, 404);
+  } catch (e) {
+    return reply({ error: e.message || "Server error." }, 500);
+  }
+}
+
+export async function POST(req, context) {
+  try {
+    const { path = [] } = await context.params;
+    const route = path.join("/");
+    const user = await getUser(req);
+    if (!user) return reply({ error: "Please log in first." }, 401);
+
+    if (route === "payments/manual") {
+      const form = await req.formData();
+      const code = String(form.get("transactionCode") || "").trim().toUpperCase();
+      const file = form.get("receipt");
+
+      if (Number(form.get("amount")) !== 100) {
+        return reply({ error: "The payment amount must be KSh 100." }, 400);
+      }
+      if (!/^[A-Z0-9]{8,15}$/.test(code)) {
+        return reply({ error: "Enter a valid M-Pesa transaction code." }, 400);
+      }
+      if (!file || typeof file.arrayBuffer !== "function" || file.size > 5 * 1024 * 1024) {
+        return reply({ error: "Choose a receipt image smaller than 5 MB." }, 400);
+      }
+      if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+        return reply({ error: "Use a JPG, PNG or WebP image." }, 400);
+      }
+
+      const { data: duplicate } = await db().from("payments")
+        .select("id").eq("transaction_code", code).maybeSingle();
+      if (duplicate) return reply({ error: "That transaction code has already been submitted." }, 409);
+
+      const extension = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
+      const storagePath = `${user.id}/${Date.now()}-${code}.${extension}`;
+      const bytes = Buffer.from(await file.arrayBuffer());
+
+      const { error: uploadError } = await db().storage.from("payment-receipts")
+        .upload(storagePath, bytes, { contentType: file.type });
+      if (uploadError) throw uploadError;
+
+      const { error } = await db().from("payments").insert({
+        user_id: user.id,
+        amount: 100,
+        method: "pochi",
+        transaction_code: code,
+        receipt_path: storagePath,
+        status: "pending"
+      });
+      if (error) throw error;
+
+      return reply({ message: "Payment submitted. It is pending manual verification." });
+    }
+
+    if (route === "surveys/submit") {
+      const body = await req.json();
+      if (!body.surveyId || !body.answers || typeof body.answers !== "object") {
+        return reply({ error: "Survey answers are required." }, 400);
+      }
+      if (!(await isUnlocked(user.id, body.surveyId))) {
+        return reply({ error: "Survey access is locked." }, 403);
+      }
+
+      const { error } = await db().from("responses").insert({
+        user_id: user.id,
+        survey_id: body.surveyId,
+        answers: body.answers
+      });
+      if (error) throw error;
+      return reply({ message: "Your survey answers have been submitted." });
+    }
+
+    if (route === "admin/create-survey") {
+      const admin = await adminUser(req);
+      if (admin.error) return admin.error;
+      const body = await req.json();
+      const title = String(body.title || "").trim();
+      const questions = body.questions;
+
+      if (!title || !Array.isArray(questions) || !questions.length) {
+        return reply({ error: "Add a title and at least one question." }, 400);
+      }
+
+      const { data, error } = await db().from("surveys").insert({
+        title,
+        description: String(body.description || ""),
+        questions,
+        created_by: admin.user.id,
+        active: true
+      }).select().single();
+      if (error) throw error;
+      return reply({ survey: data });
+    }
+
+    if (route === "admin/approve-payment") {
+      const admin = await adminUser(req);
+      if (admin.error) return admin.error;
+      const body = await req.json();
+
+      // This database function changes payment status and unlocks access atomically.
+      const { error } = await db().rpc("approve_survey_payment", {
+        p_payment_id: body.paymentId,
+        p_admin_id: admin.user.id
+      });
+      if (error) throw error;
+      return reply({ message: "Payment approved and survey access unlocked." });
+    }
+
+    if (route === "admin/reject-payment") {
+      const admin = await adminUser(req);
+      if (admin.error) return admin.error;
+      const body = await req.json();
+
+      const { data, error } = await db().from("payments").update({
+        status: "rejected",
+        verified_by: admin.user.id,
+        verified_at: new Date().toISOString()
+      }).eq("id", body.paymentId).in("status", ["pending", "review"]).select("id").maybeSingle();
+
+      if (error) throw error;
+      if (!data) return reply({ error: "Payment not found or already processed." }, 404);
+      return reply({ message: "Payment rejected." });
+    }
+
+    return reply({ error: "Not found." }, 404);
+  } catch (e) {
+    return reply({ error: e.message || "Server error." }, 500);
+  }
+}
+EOF
+
+cat > app/page.js <<'EOF'
+"use client";
+
+import { useEffect, useState } from "react";
+import { browserSupabase } from "@/lib/supabase";
+
+const supabase = browserSupabase();
+const PAY_NUMBER = "0718282275";
+const BUSINESS = "Survey Kenya Ltd";
+
+export default function Home() {
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [surveys, setSurveys] = useState([]);
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [code, setCode] = useState("");
+  const [receipt, setReceipt] = useState(null);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [adminData, setAdminData] = useState(null);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [questions, setQuestions] = useState("");
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => data.subscription.unsubscribe();
+  }, []);
+
+  const token = session?.access_token;
+
+  async function api(path, options = {}) {
+    const headers = { ...(options.headers || {}), Authorization: `Bearer ${token}` };
+    if (options.body && !(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
+    const res = await fetch(`/api/${path}`, { ...options, headers });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Request failed.");
+    return data;
+  }
+
+  async function refresh() {
+    if (!token) return;
+    try {
+      const [me, list] = await Promise.all([api("me"), api("surveys")]);
+      setProfile(me.profile);
+      setSurveys(list.surveys);
+      if (me.profile?.role === "admin") setAdminData(await api("admin"));
+    } catch (e) { setMessage(e.message); }
+  }
+
+  useEffect(() => { if (token) refresh(); }, [token]);
+
+  async function auth(e) {
+    e.preventDefault(); setBusy(true); setMessage("");
+    try {
+      if (mode === "register") {
+        const { error } = await supabase.auth.signUp({
+          email, password, options: { data: { full_name: fullName } }
+        });
+        if (error) throw error;
+        setMessage("Registration submitted. Confirm your email if requested, then log in.");
+        setMode("login");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (e) { setMessage(e.message); }
+    finally { setBusy(false); }
+  }
+
+  async function pay(e) {
+    e.preventDefault();
+    if (!receipt) return setMessage("Choose your M-Pesa confirmation screenshot.");
+    const form = new FormData();
+    form.append("amount", "100");
+    form.append("transactionCode", code);
+    form.append("receipt", receipt);
+    try {
+      setBusy(true);
+      const result = await api("payments/manual", { method: "POST", body: form });
+      setMessage(result.message);
+      setCode(""); setReceipt(null);
+    } catch (e) { setMessage(e.message); }
+    finally { setBusy(false); }
+  }
+
+  async function openSurvey(id) {
+    try {
+      const result = await api(`surveys/${id}`);
+      setSelected(result.survey); setAnswers({});
+    } catch (e) { setMessage(e.message); }
+  }
+
+  async function submitSurvey(e) {
+    e.preventDefault();
+    try {
+      const result = await api("surveys/submit", {
+        method: "POST",
+        body: JSON.stringify({ surveyId: selected.id, answers })
+      });
+      setMessage(result.message); setSelected(null);
+    } catch (e) { setMessage(e.message); }
+  }
+
+  async function adminAction(path, body) {
+    try {
+      const result = await api(path, { method: "POST", body: JSON.stringify(body) });
+      setMessage(result.message || "Completed.");
+      await refresh();
+    } catch (e) { setMessage(e.message); }
+  }
+
+  async function createSurvey(e) {
+    e.preventDefault();
+    await adminAction("admin/create-survey", {
+      title, description,
+      questions: questions.split("\n").map(x => x.trim()).filter(Boolean)
+    });
+    setTitle(""); setDescription(""); setQuestions("");
+  }
+
+  if (!session) return <main className="auth"><section className="panel authpanel">
+    <div className="logo">SK</div>
+    <h1>Survey Kenya Ltd</h1>
+    <p className="muted">Share your opinions. Participate in surveys.</p>
+    <div className="tabs">
+      <button className={mode === "login" ? "active" : ""} onClick={() => setMode("login")}>Login</button>
+      <button className={mode === "register" ? "active" : ""} onClick={() => setMode("register")}>Register</button>
+    </div>
+    <form onSubmit={auth}>
+      {mode === "register" && <label>Full name<input required value={fullName} onChange={e => setFullName(e.target.value)} /></label>}
+      <label>Email<input type="email" required value={email} onChange={e => setEmail(e.target.value)} /></label>
+      <label>Password<input type="password" minLength="6" required value={password} onChange={e => setPassword(e.target.value)} /></label>
+      <button className="primary" disabled={busy}>{busy ? "Please wait..." : mode === "login" ? "Login" : "Create account"}</button>
+    </form>
+    {message && <p className="notice">{message}</p>}
+  </section></main>;
+
+  return <main className="page">
+    <header className="topbar">
+      <div><b>Survey Kenya Ltd</b><small>Member dashboard</small></div>
+      <button className="secondary" onClick={() => supabase.auth.signOut()}>Logout</button>
+    </header>
+
+    {message && <div className="notice">{message}<button onClick={() => setMessage("")}>×</button></div>}
+
+    <section className="welcome">
+      <div><small className="eyebrow">MEMBER DASHBOARD</small><h1>Welcome{profile?.full_name ? `, ${profile.full_name}` : ""}</h1><p className="muted">Your account and available surveys.</p></div>
+      <div className="credit"><small>Promotional credit</small><strong>KSh {Number(profile?.promo_balance || 0).toFixed(2)}</strong><small>Promotional value, not withdrawable cash.</small></div>
+    </section>
+
+    <section className="panel">
+      <h2>Unlock survey access</h2>
+      <p>Pay KSh 100 using Pochi la Biashara, then submit your transaction details for manual verification.</p>
+      <div className="paymentbox">
+        <span>Payment method</span><b>Pochi la Biashara</b>
+        <span>Phone number</span><b className="number">{PAY_NUMBER}</b>
+        <span>Business name</span><b>{BUSINESS}</b>
+        <span>Amount</span><b>KSh 100</b>
+      </div>
+      <p className="small">Open M-Pesa → Lipa na M-Pesa → Pochi la Biashara. Enter the number above. Before confirming, check the recipient details shown by Safaricom. Only pay if they match the actual registered Pochi account.</p>
+      <form onSubmit={pay}>
+        <label>M-Pesa transaction code<input required value={code} onChange={e => setCode(e.target.value.toUpperCase())} placeholder="Enter transaction code" /></label>
+        <label>Upload M-Pesa screenshot<input type="file" required accept="image/png,image/jpeg,image/webp" onChange={e => setReceipt(e.target.files?.[0] || null)} /></label>
+        <button className="primary" disabled={busy}>{busy ? "Submitting..." : "Submit payment for verification"}</button>
+      </form>
+      <p className="small">Never upload your M-Pesa PIN, password or OTP. A screenshot is not proof by itself; payment is approved only after the transaction is checked against the actual account records.</p>
+    </section>
+
+    <section className="panel">
+      <h2>Available surveys</h2>
+      <div className="surveygrid">
+        {surveys.map(s => <article className="survey" key={s.id}>
+          <h3>{s.title}</h3><p>{s.description}</p>
+          {s.unlocked ? <button className="primary" onClick={() => openSurvey(s.id)}>Open survey</button> : <span className="locked">Locked — payment required</span>}
+        </article>)}
+        {!surveys.length && <p className="muted">No surveys available yet.</p>}
+      </div>
+    </section>
+
+    {selected && <section className="panel">
+      <h2>{selected.title}</h2><p>{selected.description}</p>
+      <form onSubmit={submitSurvey}>
+        {selected.questions.map((q, i) => <label key={i}>{i + 1}. {q}<textarea required value={answers[i] || ""} onChange={e => setAnswers(a => ({ ...a, [i]: e.target.value }))} /></label>)}
+        <button className="primary">Submit answers</button>
+        <button type="button" className="secondary" onClick={() => setSelected(null)}>Close</button>
+      </form>
+    </section>}
+
+    {profile?.role === "admin" && <section className="panel">
+      <div className="adminhead"><h2>Admin dashboard</h2><button className="secondary" onClick={refresh}>Refresh</button></div>
+      <h3>Create survey</h3>
+      <form onSubmit={createSurvey}>
+        <label>Title<input required value={title} onChange={e => setTitle(e.target.value)} /></label>
+        <label>Description<input value={description} onChange={e => setDescription(e.target.value)} /></label>
+        <label>Questions — one per line<textarea required value={questions} onChange={e => setQuestions(e.target.value)} /></label>
+        <button className="primary">Create survey</button>
+      </form>
+      <h3>Payment submissions</h3>
+      {(adminData?.payments || []).map(p => <article className="paymentrow" key={p.id}>
+        <div><b>{p.transaction_code}</b><p>KSh {p.amount} · {p.status}</p>{p.receipt_url && <a href={p.receipt_url} target="_blank" rel="noreferrer">View screenshot</a>}</div>
+        {["pending","review"].includes(p.status) && <div className="actions">
+          <button className="primary" onClick={() => adminAction("admin/approve-payment", { paymentId: p.id })}>Approve</button>
+          <button className="danger" onClick={() => adminAction("admin/reject-payment", { paymentId: p.id })}>Reject</button>
+        </div>}
+      </article>)}
+      <h3>Members</h3>
+      {(adminData?.users || []).map(u => <p className="member" key={u.id}>{u.full_name || "Member"} · {u.role} · Promo KSh {u.promo_balance}</p>)}
+    </section>}
+
+    <footer>© {new Date().getFullYear()} Survey Kenya Ltd</footer>
+  </main>;
+}
+EOF
+
+cat > app/layout.js <<'EOF'
+import "./globals.css";
+
+export const metadata = {
+  title: "Survey Kenya Ltd",
+  description: "Survey participation platform"
+};
+
+export default function RootLayout({ children }) {
+  return <html lang="en"><body>{children}</body></html>;
+}
+EOF
+
+cat > app/globals.css <<'EOF'
+*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#172033;font-family:Arial,sans-serif}.auth{min-height:100vh;display:grid;place-items:center;padding:18px}.panel{background:#fff;border:1px solid #e4eaf1;border-radius:15px;padding:23px;margin:20px 0;box-shadow:0 5px 20px #14243a0a}.authpanel{width:min(100%,430px)}.logo{width:48px;height:48px;border-radius:13px;background:#145da0;color:white;display:grid;place-items:center;font-weight:bold}.muted,.small{color:#69758a}.small{font-size:12px;line-height:1.6}.tabs{display:flex;gap:8px;margin:20px 0}.tabs button,.secondary{background:#edf2f8;color:#25364b;border:0;border-radius:8px;padding:10px 14px;cursor:pointer}.tabs .active{background:#dceaff;color:#145da0;font-weight:bold}label{display:block;font-weight:600;font-size:14px;margin:14px 0}input,textarea{display:block;width:100%;padding:12px;border:1px solid #d8e0ea;border-radius:8px;margin-top:7px;font:inherit;background:white}textarea{min-height:85px}.primary,.danger{border:0;border-radius:8px;padding:12px 16px;cursor:pointer;font-weight:bold}.primary{background:#145da0;color:#fff}.danger{background:#fee2e2;color:#991b1b}.authpanel form .primary{width:100%}.page{max-width:1050px;margin:auto;padding:18px}.topbar{display:flex;justify-content:space-between;align-items:center;padding:14px 0}.topbar b,.topbar small{display:block}.welcome{display:flex;justify-content:space-between;align-items:center;gap:20px;padding:22px 0}.welcome h1{margin:5px 0}.eyebrow{color:#145da0;letter-spacing:1px}.credit{background:#e5f0ff;padding:16px;border-radius:12px;min-width:190px}.credit small,.credit strong{display:block}.credit strong{font-size:23px;margin:8px 0}.paymentbox{display:grid;grid-template-columns:1fr 1fr;gap:10px;background:#f3f7fc;padding:16px;border-radius:10px}.paymentbox span{color:#68758a}.number{font-size:20px;color:#145da0}.surveygrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.survey{border:1px solid #e5eaf1;border-radius:12px;padding:16px}.survey h3{margin-top:0}.locked{font-size:13px;color:#8a5a12}.notice{background:#fff6dc;border:1px solid #f1d58c;padding:12px;border-radius:9px;margin:14px 0}.notice button{float:right;border:0;background:none;font-size:18px}.adminhead{display:flex;justify-content:space-between;align-items:center}.paymentrow{display:flex;justify-content:space-between;gap:12px;align-items:center;border-top:1px solid #e5eaf1;padding:14px 0}.paymentrow p,.member{font-size:13px;color:#68758a}.actions{display:flex;gap:7px}footer{text-align:center;color:#8490a2;font-size:12px;padding:30px 0}@media(max-width:650px){.page{padding:12px}.panel{padding:17px}.welcome{display:block}.credit{margin-top:15px}.paymentrow{align-items:flex-start;flex-direction:column}.paymentbox{grid-template-columns:1fr 1fr}}
+EOF
+
+cat > supabase-schema.sql <<'EOF'
+create extension if not exists pgcrypto;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  full_name text,
+  role text not null default 'user' check (role in ('user','admin')),
+  promo_balance numeric(10,2) not null default 100,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.surveys (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  description text default '',
+  questions jsonb not null default '[]'::jsonb,
+  active boolean not null default true,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.payments (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id),
+  amount numeric(10,2) not null check (amount = 100),
+  method text not null default 'pochi',
+  transaction_code text not null unique,
+  receipt_path text,
+  status text not null default 'pending'
+    check (status in ('pending','review','paid','rejected')),
+  verified_by uuid references auth.users(id),
+  verified_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.unlocks (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id),
+  survey_id uuid references public.surveys(id) on delete cascade,
+  payment_id uuid references public.payments(id),
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists unlocks_user_survey_unique
+on public.unlocks(user_id, coalesce(survey_id, '00000000-0000-0000-0000-000000000000'::uuid));
+
+create table if not exists public.responses (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id),
+  survey_id uuid not null references public.surveys(id),
+  answers jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+create or replace function public.new_profile()
+returns trigger language plpgsql security definer set search_path = public
+as $$
+begin
+  insert into public.profiles(id, full_name, promo_balance)
+  values(new.id, coalesce(new.raw_user_meta_data->>'full_name',''), 100)
+  on conflict (id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists create_profile_after_signup on auth.users;
+create trigger create_profile_after_signup
+after insert on auth.users
+for each row execute procedure public.new_profile();
+
+create or replace function public.approve_survey_payment(
+  p_payment_id uuid,
+  p_admin_id uuid
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_payment public.payments%rowtype;
+begin
+  select * into v_payment
+  from public.payments
+  where id = p_payment_id and status in ('pending','review')
+  for update;
+
+  if not found then
+    raise exception 'Payment not found or already processed';
+  end if;
+
+  update public.payments
+  set status = 'paid',
+      verified_by = p_admin_id,
+      verified_at = now()
+  where id = p_payment_id;
+
+  insert into public.unlocks(user_id, survey_id, payment_id)
+  values(v_payment.user_id, null, v_payment.id)
+  on conflict do nothing;
+end;
+$$;
+
+revoke all on function public.approve_survey_payment(uuid,uuid) from public, anon, authenticated;
+grant execute on function public.approve_survey_payment(uuid,uuid) to service_role;
+
+alter table public.profiles enable row level security;
+alter table public.surveys enable row level security;
+alter table public.payments enable row level security;
+alter table public.unlocks enable row level security;
+alter table public.responses enable row level security;
+
+drop policy if exists "profile owner reads own profile" on public.profiles;
+create policy "profile owner reads own profile" on public.profiles
+for select to authenticated using (auth.uid() = id);
+
+drop policy if exists "active surveys visible" on public.surveys;
+create policy "active surveys visible" on public.surveys
+for select to authenticated using (active = true);
+
+drop policy if exists "user reads own payments" on public.payments;
+create policy "user reads own payments" on public.payments
+for select to authenticated using (auth.uid() = user_id);
+
+drop policy if exists "user reads own unlocks" on public.unlocks;
+create policy "user reads own unlocks" on public.unlocks
+for select to authenticated using (auth.uid() = user_id);
+
+drop policy if exists "user reads own responses" on public.responses;
+create policy "user reads own responses" on public.responses
+for select to authenticated using (auth.uid() = user_id);
+
+insert into storage.buckets (id,name,public,file_size_limit,allowed_mime_types)
+values ('payment-receipts','payment-receipts',false,5242880,array['image/jpeg','image/png','image/webp'])
+on conflict (id) do nothing;
+EOF
+
+echo "Survey Kenya Ltd files created successfully."
